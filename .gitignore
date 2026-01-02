@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OneDrive temp files
+*.tmp
+*.lnk
