@@ -30,24 +30,40 @@ def modelrunner(mdlpath: str, prompt:str, data:str)->str:
     # )
 
     chat = [
-        {
-            "role": "system",
-            "content": instruction_prompt
-        },
-        {
-            "role": "user",
-            "content": "YAML Schema:\n" + schema_prompt
-        },
-        {
-            "role": "user",
-            "content": "Invoice Text:\n" + document_text
-        }
-    ]
+    {
+        "role": "system",
+        "content": instruction_prompt
+    },
+    {
+        "role": "user",
+        "content": "YAML Schema:\n" + schema_prompt
+    },
+    {
+        "role": "user",
+        "content": "Invoice Text:\n" + document_text
+    }
+]
 
+    chat_text = tokenizer.apply_chat_template(
+        chat,
+        tokenize=False,
+        add_generation_prompt=True
+    )
 
-    chat = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-    input_tokens = tokenizer(chat, return_tensors="pt").to(device)
-    output = model.generate(**input_tokens, max_new_tokens=500)
-    output = tokenizer.batch_decode(output)
-    results = str(output[0])
-    return results
+    input_tokens = tokenizer(chat_text, return_tensors="pt").to(device)
+
+    output = model.generate(
+        **input_tokens,
+        max_new_tokens=500,
+        do_sample=False
+    )
+
+    input_len = input_tokens["input_ids"].shape[1]
+    generated_ids = output[0][input_len:]
+
+    final_response = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True
+    ).strip()
+
+    return final_response
