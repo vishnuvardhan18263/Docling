@@ -9,40 +9,8 @@ def modelrunner(mdlpath: str, prompt:str, data:str)->str:
     model = AutoModelForCausalLM.from_pretrained(mdlpath)
     model.eval()
 
-    document_text = data    # OCR / extracted PDF text
-
-    # final_prompt = f"""
-    #     You are an invoice extraction engine.
-    #     Use the following YAML schema and extract values from the document text.
-    #     Return ONLY valid YAML.
-        
-    #     You are a finance expert. Make sure to extract the following required data into a structured format:
-    #     • Invoice Number
-    #     • Company Code
-    #     • Supplier
-    #     • Reference Number
-    #     • Invoice Date
-    #     • Shipment Date
-    #     • Currency Type
-    #     • Tax Amount
-    #     • Total Amount
-    #     • AccountName
-    #     • BankName
-    #     • Address
-    #     • AccountNumber
-    #     • Sweift code/Swift code
-    #     Note:
-    #     > If the above fields are not available, see the respective linked data.
-    #     > For example, Invoice Number can also be a PO number or just a number.
-
-    #     ### DOCUMENT TEXT
-    #     {document_text}
-
-    #     ### OUTPUT
-    #     """
-
-
-
+    document_text = data 
+    
     prompt = """You are a finance expert. Make sure to extract the following required data into a structured format:
     • Invoice Number
     • Company Code
@@ -89,5 +57,3 @@ def modelrunner(mdlpath: str, prompt:str, data:str)->str:
     ).strip()
     print("MODEL OUTPUT:\n", result)
     return result
-    
-
