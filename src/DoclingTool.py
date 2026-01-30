@@ -5,6 +5,9 @@ import os
 import sys
 import csv
 from openpyxl import Workbook
+from openpyxl.styles import Font, Border, Side
+from openpyxl.utils import get_column_letter
+
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -133,11 +136,25 @@ def process_document():
                     writer.writerows(rows)
                 generated_files.append(csv_path)
 
+                messagebox.showinfo(
+                "Completed",
+                "Files generated successfully:\n\n" + "\n".join(generated_files)
+            )
         # ------------------ EXCEL ------------------
         elif fmt == "Excel (.xlsx)":
             wb = Workbook()
             ws = wb.active
             ws.title = "Sheet1"
+
+            bold_font = Font(bold=True)
+
+            thin_side = Side(style="thin")
+            ibm_border = Border(
+                left=thin_side,
+                right=thin_side,
+                top=thin_side,
+                bottom=thin_side
+            )
 
             lines = markdown_text.splitlines()
             tables = parse_markdown_tables(markdown_text)
@@ -146,44 +163,57 @@ def process_document():
             row_ptr = 1
             i = 0
 
+            max_col_width = {}
+
             while i < len(lines):
                 line = lines[i]
 
-                # -------- TABLE DETECTED --------
+                # ---------- TABLE ----------
                 if "|" in line and table_idx < len(tables):
                     headers, rows = tables[table_idx]
                     col_count = len(headers)
 
                     # write headers
                     for col, h in enumerate(headers, start=1):
-                        ws.cell(row=row_ptr, column=col, value=h)
+                        cell = ws.cell(row=row_ptr, column=col, value=h)
+                        cell.font = bold_font
+                        cell.border = ibm_border
+                        max_col_width[col] = max(max_col_width.get(col, 0), len(str(h)))
+
                     row_ptr += 1
 
                     # write rows
                     for r in rows:
                         for col in range(col_count):
-                            ws.cell(
-                                row=row_ptr,
-                                column=col + 1,
-                                value=r[col] if col < len(r) else ""
+                            value = r[col] if col < len(r) else ""
+                            cell = ws.cell(row=row_ptr, column=col + 1, value=value)
+                            cell.border = ibm_border
+                            max_col_width[col + 1] = max(
+                                max_col_width.get(col + 1, 0),
+                                len(str(value))
                             )
                         row_ptr += 1
 
                     table_idx += 1
 
-                    # skip original markdown table lines
+                    # skip markdown table lines
                     while i < len(lines) and "|" in lines[i]:
                         i += 1
 
-                    row_ptr += 1  # blank row after table
+                    row_ptr += 1
                     continue
 
-                # -------- NORMAL TEXT --------
-                ws.cell(row=row_ptr, column=1, value=line)
+                # ---------- NORMAL TEXT ----------
+                cell = ws.cell(row=row_ptr, column=1, value=line)
+                max_col_width[1] = max(max_col_width.get(1, 0), len(str(line)))
                 row_ptr += 1
                 i += 1
 
-            # ✅ SAVE ONCE
+            # ---------- AUTO COLUMN WIDTH ----------
+            for col, width in max_col_width.items():
+                ws.column_dimensions[get_column_letter(col)].width = min(width + 3, 60)
+
+            # ---------- SAVE ONCE ----------
             xlsx_path = os.path.join(output_dir, base + ".xlsx")
             wb.save(xlsx_path)
             generated_files.append(xlsx_path)
@@ -200,9 +230,15 @@ def process_document():
 # ------------------ UI ------------------
 
 root = tk.Tk()
-root.title("Docling Invoice Converter")
+root.title("Document Conversion Tool (PRF->Txt,csv,md,xlsx)")
 root.resizable(False, False)
 center_window(root)
+
+#  Make window active on open
+root.update_idletasks()
+root.attributes("-topmost", True)
+root.focus_force()
+root.after(200, lambda: root.attributes("-topmost", False))
 
 BG = "#F4F4F4"
 FG = "#161616"
@@ -234,11 +270,11 @@ frame = tk.Frame(root, bg=BG)
 frame.pack(expand=True, fill="both", padx=30, pady=25)
 
 ttk.Label(frame, text="Input Invoice PDF").grid(row=0, column=0, sticky="w")
-ttk.Entry(frame, textvariable=input_var, width=55).grid(row=1, column=0, padx=(0, 10))
+ttk.Entry(frame, textvariable=input_var, width=70).grid(row=1, column=0, padx=(0, 10))
 ttk.Button(frame, text="Browse", command=browse_file).grid(row=1, column=1)
 
 ttk.Label(frame, text="Output Folder").grid(row=2, column=0, sticky="w", pady=10)
-ttk.Entry(frame, textvariable=output_var, width=55).grid(row=3, column=0, padx=(0, 10))
+ttk.Entry(frame, textvariable=output_var, width=70).grid(row=3, column=0, padx=(0, 10))
 ttk.Button(frame, text="Browse", command=browse_output).grid(row=3, column=1)
 
 ttk.Label(frame, text="Output Format").grid(row=4, column=0, sticky="w", pady=10)
