@@ -33,18 +33,29 @@ def parse_markdown_tables(markdown_text):
     parsed_tables = []
 
     for table in tables:
-        rows = []
+        raw_rows = []
         for row in table:
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            # Skip separator rows like |----|----|
+            # skip separator rows like |----|----|
             if all(set(c) <= {"-", ":"} for c in cells):
                 continue
-            rows.append(cells)
+            raw_rows.append(cells)
 
-        if len(rows) >= 2:
-            headers = rows[0]
-            data_rows = rows[1:]
-            parsed_tables.append((headers, data_rows))
+        if len(raw_rows) < 2:
+            continue
+
+        headers = raw_rows[0]
+        col_count = len(headers)
+
+        normalized_rows = []
+        for r in raw_rows[1:]:
+            if len(r) < col_count:
+                r = r + [""] * (col_count - len(r))
+            elif len(r) > col_count:
+                r = r[:col_count]
+            normalized_rows.append(r)
+
+        parsed_tables.append((headers, normalized_rows))
 
     return parsed_tables
 
@@ -58,17 +69,17 @@ def center_window(win, width=720, height=380):
     win.geometry(f"{width}x{height}+{x}+{y}")
 
 def browse_file():
-    file_path = filedialog.askopenfilename(
+    path = filedialog.askopenfilename(
         title="Select Invoice PDF",
         filetypes=[("PDF Files", "*.pdf")]
     )
-    if file_path:
-        input_var.set(file_path)
+    if path:
+        input_var.set(path)
 
 def browse_output():
-    folder_path = filedialog.askdirectory(title="Select Output Folder")
-    if folder_path:
-        output_var.set(folder_path)
+    path = filedialog.askdirectory(title="Select Output Folder")
+    if path:
+        output_var.set(path)
 
 
 # ------------------ PROCESS ------------------
@@ -87,70 +98,117 @@ def process_document():
         result = converter.convert(source)
         markdown_text = result.document.export_to_markdown()
 
-        base_name = os.path.splitext(os.path.basename(source))[0]
+        base = os.path.splitext(os.path.basename(source))[0]
+        generated_files = []
+
+        tables = parse_markdown_tables(markdown_text)
 
         # ------------------ MARKDOWN / TXT ------------------
         if fmt in ("Markdown (.md)", "Text (.txt)"):
             ext = ".md" if "Markdown" in fmt else ".txt"
-            out_path = os.path.join(output_dir, base_name + ext)
+            out_path = os.path.join(output_dir, base + ext)
+
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown_text)
+                for i, (headers, rows) in enumerate(tables, 1):
+                    f.write(f"\n\n--- TABLE {i} ---\n")
+                    f.write(" | ".join(headers) + "\n")
+                    for r in rows:
+                        f.write(" | ".join(r) + "\n")
+
+            generated_files.append(out_path)
 
         # ------------------ CSV ------------------
         elif fmt == "CSV (.csv)":
-            tables = parse_markdown_tables(markdown_text)
+            header_path = os.path.join(output_dir, base + "_header.txt")
+            with open(header_path, "w", encoding="utf-8") as f:
+                f.write(markdown_text)
+            generated_files.append(header_path)
 
-            if not tables:
-                raise ValueError("No tables found in document")
-
-            for idx, (headers, rows) in enumerate(tables, start=1):
-                csv_path = os.path.join(
-                    output_dir, f"{base_name}_table_{idx}.csv"
-                )
+            for i, (headers, rows) in enumerate(tables, 1):
+                csv_path = os.path.join(output_dir, f"{base}_table_{i}.csv")
                 with open(csv_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(headers)
                     writer.writerows(rows)
+                generated_files.append(csv_path)
 
         # ------------------ EXCEL ------------------
         elif fmt == "Excel (.xlsx)":
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+
+            lines = markdown_text.splitlines()
             tables = parse_markdown_tables(markdown_text)
 
-            if not tables:
-                raise ValueError("No tables found in document")
+            table_idx = 0
+            row_ptr = 1
+            i = 0
 
-            wb = Workbook()
-            wb.remove(wb.active)
+            while i < len(lines):
+                line = lines[i]
 
-            for idx, (headers, rows) in enumerate(tables, start=1):
-                ws = wb.create_sheet(title=f"Table_{idx}")
-                ws.append(headers)
-                for r in rows:
-                    ws.append(r)
+                # -------- TABLE DETECTED --------
+                if "|" in line and table_idx < len(tables):
+                    headers, rows = tables[table_idx]
+                    col_count = len(headers)
 
-            xlsx_path = os.path.join(output_dir, base_name + ".xlsx")
+                    # write headers
+                    for col, h in enumerate(headers, start=1):
+                        ws.cell(row=row_ptr, column=col, value=h)
+                    row_ptr += 1
+
+                    # write rows
+                    for r in rows:
+                        for col in range(col_count):
+                            ws.cell(
+                                row=row_ptr,
+                                column=col + 1,
+                                value=r[col] if col < len(r) else ""
+                            )
+                        row_ptr += 1
+
+                    table_idx += 1
+
+                    # skip original markdown table lines
+                    while i < len(lines) and "|" in lines[i]:
+                        i += 1
+
+                    row_ptr += 1  # blank row after table
+                    continue
+
+                # -------- NORMAL TEXT --------
+                ws.cell(row=row_ptr, column=1, value=line)
+                row_ptr += 1
+                i += 1
+
+            # ✅ SAVE ONCE
+            xlsx_path = os.path.join(output_dir, base + ".xlsx")
             wb.save(xlsx_path)
+            generated_files.append(xlsx_path)
 
-        messagebox.showinfo("Success", "Invoice processed successfully")
+            messagebox.showinfo(
+                "Completed",
+                "Files generated successfully:\n\n" + "\n".join(generated_files)
+            )
 
     except Exception as e:
         messagebox.showerror("Processing Failed", str(e))
 
 
-# ------------------ MAIN UI ------------------
+# ------------------ UI ------------------
 
 root = tk.Tk()
 root.title("Docling Invoice Converter")
 root.resizable(False, False)
 center_window(root)
 
-# IBM Carbon Light Theme
 BG = "#F4F4F4"
 FG = "#161616"
 BTN_BG = "#0F62FE"
 BTN_ACTIVE = "#0353E9"
 BTN_FG = "#FFFFFF"
-ENTRY_BG = "#FFFFFF"
 
 root.configure(bg=BG)
 
@@ -158,7 +216,7 @@ style = ttk.Style()
 style.theme_use("clam")
 
 style.configure("TLabel", background=BG, foreground=FG, font=("Segoe UI", 10))
-style.configure("TEntry", fieldbackground=ENTRY_BG, foreground=FG)
+style.configure("TEntry", fieldbackground="#FFFFFF", foreground=FG)
 style.configure(
     "TButton",
     background=BTN_BG,
@@ -168,13 +226,9 @@ style.configure(
 )
 style.map("TButton", background=[("active", BTN_ACTIVE)])
 
-# ------------------ VARIABLES ------------------
-
 input_var = tk.StringVar()
 output_var = tk.StringVar()
 format_var = tk.StringVar(value="Markdown (.md)")
-
-# ------------------ LAYOUT ------------------
 
 frame = tk.Frame(root, bg=BG)
 frame.pack(expand=True, fill="both", padx=30, pady=25)
@@ -196,10 +250,7 @@ ttk.Combobox(
     width=22
 ).grid(row=5, column=0, sticky="w")
 
-ttk.Button(
-    frame,
-    text="Convert Invoice",
-    command=process_document
-).grid(row=6, column=0, pady=25)
+ttk.Button(frame, text="Convert Invoice", command=process_document)\
+    .grid(row=6, column=0, pady=25)
 
 root.mainloop()
