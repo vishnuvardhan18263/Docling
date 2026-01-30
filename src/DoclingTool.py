@@ -8,6 +8,47 @@ from openpyxl import Workbook
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+# ------------------ TABLE PARSER ------------------
+
+def parse_markdown_tables(markdown_text):
+    tables = []
+    lines = markdown_text.splitlines()
+
+    current_table = []
+    inside_table = False
+
+    for line in lines:
+        if "|" in line:
+            inside_table = True
+            current_table.append(line)
+        else:
+            if inside_table:
+                tables.append(current_table)
+                current_table = []
+                inside_table = False
+
+    if current_table:
+        tables.append(current_table)
+
+    parsed_tables = []
+
+    for table in tables:
+        rows = []
+        for row in table:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            # Skip separator rows like |----|----|
+            if all(set(c) <= {"-", ":"} for c in cells):
+                continue
+            rows.append(cells)
+
+        if len(rows) >= 2:
+            headers = rows[0]
+            data_rows = rows[1:]
+            parsed_tables.append((headers, data_rows))
+
+    return parsed_tables
+
+
 # ------------------ UI HELPERS ------------------
 
 def center_window(win, width=720, height=380):
@@ -29,24 +70,8 @@ def browse_output():
     if folder_path:
         output_var.set(folder_path)
 
-def save_output(content, path, fmt):
-    if fmt == "Markdown (.md)" or fmt == "Text (.txt)":
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
 
-    elif fmt == "CSV (.csv)":
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            for line in content.splitlines():
-                writer.writerow([line])
-
-    elif fmt == "Excel (.xlsx)":
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Invoice"
-        for line in content.splitlines():
-            ws.append([line])
-        wb.save(path)
+# ------------------ PROCESS ------------------
 
 def process_document():
     source = input_var.get()
@@ -60,24 +85,57 @@ def process_document():
     try:
         converter = DocumentConverter()
         result = converter.convert(source)
-        content = result.document.export_to_markdown()
-
-        ext_map = {
-            "Markdown (.md)": ".md",
-            "Text (.txt)": ".txt",
-            "CSV (.csv)": ".csv",
-            "Excel (.xlsx)": ".xlsx"
-        }
+        markdown_text = result.document.export_to_markdown()
 
         base_name = os.path.splitext(os.path.basename(source))[0]
-        output_file = os.path.join(output_dir, base_name + ext_map[fmt])
 
-        save_output(content, output_file, fmt)
+        # ------------------ MARKDOWN / TXT ------------------
+        if fmt in ("Markdown (.md)", "Text (.txt)"):
+            ext = ".md" if "Markdown" in fmt else ".txt"
+            out_path = os.path.join(output_dir, base_name + ext)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(markdown_text)
 
-        messagebox.showinfo("Success", f"File generated:\n{output_file}")
+        # ------------------ CSV ------------------
+        elif fmt == "CSV (.csv)":
+            tables = parse_markdown_tables(markdown_text)
+
+            if not tables:
+                raise ValueError("No tables found in document")
+
+            for idx, (headers, rows) in enumerate(tables, start=1):
+                csv_path = os.path.join(
+                    output_dir, f"{base_name}_table_{idx}.csv"
+                )
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+
+        # ------------------ EXCEL ------------------
+        elif fmt == "Excel (.xlsx)":
+            tables = parse_markdown_tables(markdown_text)
+
+            if not tables:
+                raise ValueError("No tables found in document")
+
+            wb = Workbook()
+            wb.remove(wb.active)
+
+            for idx, (headers, rows) in enumerate(tables, start=1):
+                ws = wb.create_sheet(title=f"Table_{idx}")
+                ws.append(headers)
+                for r in rows:
+                    ws.append(r)
+
+            xlsx_path = os.path.join(output_dir, base_name + ".xlsx")
+            wb.save(xlsx_path)
+
+        messagebox.showinfo("Success", "Invoice processed successfully")
 
     except Exception as e:
         messagebox.showerror("Processing Failed", str(e))
+
 
 # ------------------ MAIN UI ------------------
 
@@ -86,14 +144,13 @@ root.title("Docling Invoice Converter")
 root.resizable(False, False)
 center_window(root)
 
-# IBM Carbon Light
+# IBM Carbon Light Theme
 BG = "#F4F4F4"
 FG = "#161616"
 BTN_BG = "#0F62FE"
 BTN_ACTIVE = "#0353E9"
 BTN_FG = "#FFFFFF"
 ENTRY_BG = "#FFFFFF"
-BORDER = "#C6C6C6"
 
 root.configure(bg=BG)
 
@@ -107,8 +164,7 @@ style.configure(
     background=BTN_BG,
     foreground=BTN_FG,
     font=("Segoe UI", 10, "bold"),
-    padding=8,
-    borderwidth=0
+    padding=8
 )
 style.map("TButton", background=[("active", BTN_ACTIVE)])
 
@@ -137,7 +193,7 @@ ttk.Combobox(
     textvariable=format_var,
     values=["Markdown (.md)", "Text (.txt)", "CSV (.csv)", "Excel (.xlsx)"],
     state="readonly",
-    width=20
+    width=22
 ).grid(row=5, column=0, sticky="w")
 
 ttk.Button(
