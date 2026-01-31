@@ -1,316 +1,198 @@
+import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from docling.document_converter import DocumentConverter
-import os
-import sys
-import csv
-import tempfile
-
+from PIL import Image, ImageTk
 import fitz  # PyMuPDF
-from PIL import Image
+import pandas as pd  # Required for Excel export
+from docling.document_converter import DocumentConverter
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, Border, Side
-from openpyxl.utils import get_column_letter
+# Supported extensions for INPUT files
+SUPPORTED_EXT = (".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff")
 
-sys.stdout.reconfigure(encoding="utf-8")
+class DoclingOCRApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Docling OCR Utility")
+        self.root.geometry("1200x720")
+        self.root.focus_force()
+        
+        # Data containers
+        self.selected_file = None
+        self.output_folder = None  # Renamed to clarify it is for OUTPUT
+        self.original_image = None
+        self.preview_image = None
+        
+        self.build_ui()
 
-# =========================================================
-# PDF → IMAGE (SCANNED MODE)
-# =========================================================
+    # ---------------- UI ---------------- #
+    def build_ui(self):
+        top = tk.Frame(self.root)
+        top.pack(fill="x", padx=10, pady=5)
+        
+        # Buttons
+        tk.Button(top, text="Select Input File (PDF/Img)", command=self.pick_file).pack(side="left")
+        tk.Button(top, text="Select Output Folder", command=self.pick_output_folder).pack(side="left", padx=10)
+        
+        # Labels area
+        labels = tk.Frame(self.root)
+        labels.pack(fill="x", padx=10)
+        
+        self.file_label = tk.Label(labels, text="Input File: None", anchor="w", fg="blue")
+        self.file_label.pack(fill="x")
+        
+        self.folder_label = tk.Label(labels, text="Output Folder: [Same as Input]", anchor="w", fg="green")
+        self.folder_label.pack(fill="x")
+        
+        # Main body (Canvas + Sidebar)
+        body = tk.Frame(self.root)
+        body.pack(fill="both", expand=True)
+        
+        self.canvas = tk.Canvas(body, bg="#eeeeee")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        
+        side = tk.Frame(body, width=260)
+        side.pack(side="right", fill="y", padx=10)
+        
+        # Sidebar Controls
+        tk.Label(side, text="Rotation (Preview Only)").pack(anchor="w", pady=(10, 0))
+        self.rotation = tk.StringVar(value="0")
+        rot = ttk.Combobox(side, textvariable=self.rotation, 
+                           values=["0", "90", "180", "270"], state="readonly")
+        rot.pack(fill="x")
+        rot.bind("<<ComboboxSelected>>", lambda e: self.update_preview())
+        
+        tk.Label(side, text="Output Format").pack(anchor="w", pady=(15, 0))
+        self.output_fmt = tk.StringVar(value="xlsx")
+        ttk.Combobox(side, textvariable=self.output_fmt, 
+                     values=["xlsx", "txt"], state="readonly").pack(fill="x")
+        
+        self.start_btn = tk.Button(side, text="Start OCR", height=2, command=self.start_thread)
+        self.start_btn.pack(fill="x", pady=20)
+        
+        self.progress = ttk.Progressbar(side, mode="indeterminate")
+        self.progress.pack(fill="x")
 
-def pdf_to_images(pdf_path, dpi=300):
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-
-    temp_dir = tempfile.mkdtemp(prefix="docling_pages_")
-    image_paths = []
-
-    for i in range(len(doc)):
-        page = doc[i]
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_path = os.path.join(temp_dir, f"page_{i+1}.png")
-        pix.save(img_path)
-        image_paths.append(img_path)
-
-    return image_paths
-
-
-def auto_rotate_image(image_path):
-    try:
-        img = Image.open(image_path)
-        img = Image.Image.transpose(img, Image.Transpose.EXIF)
-        img.save(image_path)
-    except Exception:
-        pass
-    return image_path
-
-
-# =========================================================
-# MARKDOWN TABLE PARSER
-# =========================================================
-
-def parse_markdown_tables(markdown_text):
-    tables = []
-    lines = markdown_text.splitlines()
-
-    current = []
-    inside = False
-
-    for line in lines:
-        if "|" in line:
-            inside = True
-            current.append(line)
-        else:
-            if inside:
-                tables.append(current)
-                current = []
-                inside = False
-
-    if current:
-        tables.append(current)
-
-    parsed = []
-
-    for table in tables:
-        rows = []
-        for r in table:
-            cells = [c.strip() for c in r.strip("|").split("|")]
-            if all(set(c) <= {"-", ":"} for c in cells):
-                continue
-            rows.append(cells)
-
-        if len(rows) < 2:
-            continue
-
-        headers = rows[0]
-        col_len = len(headers)
-
-        data = []
-        for r in rows[1:]:
-            if len(r) < col_len:
-                r += [""] * (col_len - len(r))
-            data.append(r[:col_len])
-
-        parsed.append((headers, data))
-
-    return parsed
-
-
-# =========================================================
-# UI HELPERS
-# =========================================================
-
-def center_window(win, w=760, h=430):
-    win.update_idletasks()
-    x = (win.winfo_screenwidth() // 2) - (w // 2)
-    y = (win.winfo_screenheight() // 2) - (h // 2)
-    win.geometry(f"{w}x{h}+{x}+{y}")
-
-
-def browse_file():
-    path = filedialog.askopenfilename(
-        title="Select PDF or Image",
-        filetypes=[
-            ("Supported Files", "*.pdf *.png *.jpg *.jpeg *.bmp *.tiff")
-        ]
-    )
-    if path:
-        input_var.set(path)
-
-
-def browse_output():
-    path = filedialog.askdirectory(title="Select Output Folder")
-    if path:
-        output_var.set(path)
-
-
-# =========================================================
-# CORE PROCESS
-# =========================================================
-
-def process_document():
-    source = input_var.get()
-    out_dir = output_var.get()
-    fmt = format_var.get()
-    scanned_mode = scanned_var.get()
-
-    if not source or not out_dir:
-        messagebox.showerror("Error", "Please select input file and output folder")
-        return
-
-    try:
-        converter = DocumentConverter()
-        ext = os.path.splitext(source)[1].lower()
-
-        docs_to_process = []
-
-        # ---------- SCANNED PDF MODE ----------
-        if scanned_mode and ext == ".pdf":
-            pages = pdf_to_images(source, dpi=300)
-            for p in pages:
-                docs_to_process.append(auto_rotate_image(p))
-
-        else:
-            docs_to_process.append(source)
-
-        markdown_text = ""
-        for doc in docs_to_process:
-            result = converter.convert(doc)
-            markdown_text += "\n\n" + result.document.export_to_markdown()
-
-        base = os.path.splitext(os.path.basename(source))[0]
-        generated_files = []
-
-        tables = parse_markdown_tables(markdown_text)
-
-        # =====================================================
-        # EXCEL OUTPUT
-        # =====================================================
-        if fmt == "Excel (.xlsx)":
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Sheet1"
-
-            bold = Font(bold=True)
-            border = Border(
-                left=Side(style="thin"),
-                right=Side(style="thin"),
-                top=Side(style="thin"),
-                bottom=Side(style="thin")
-            )
-
-            lines = markdown_text.splitlines()
-            table_idx = 0
-            row_ptr = 1
-            i = 0
-            col_widths = {}
-
-            while i < len(lines):
-                line = lines[i]
-
-                if "|" in line and table_idx < len(tables):
-                    headers, rows = tables[table_idx]
-                    cols = len(headers)
-
-                    for c, h in enumerate(headers, 1):
-                        cell = ws.cell(row=row_ptr, column=c, value=h)
-                        cell.font = bold
-                        cell.border = border
-                        col_widths[c] = max(col_widths.get(c, 0), len(str(h)))
-
-                    row_ptr += 1
-
-                    for r in rows:
-                        for c in range(cols):
-                            val = r[c]
-                            cell = ws.cell(row=row_ptr, column=c+1, value=val)
-                            cell.border = border
-                            col_widths[c+1] = max(col_widths.get(c+1, 0), len(str(val)))
-                        row_ptr += 1
-
-                    table_idx += 1
-                    while i < len(lines) and "|" in lines[i]:
-                        i += 1
-
-                    row_ptr += 1
-                    continue
-
-                ws.cell(row=row_ptr, column=1, value=line)
-                col_widths[1] = max(col_widths.get(1, 0), len(line))
-                row_ptr += 1
-                i += 1
-
-            for c, w in col_widths.items():
-                ws.column_dimensions[get_column_letter(c)].width = min(w + 3, 60)
-
-            out_path = os.path.join(out_dir, base + ".xlsx")
-            wb.save(out_path)
-            generated_files.append(out_path)
-
-        # =====================================================
-        # MARKDOWN / TXT / CSV (UNCHANGED)
-        # =====================================================
-        else:
-            ext_map = {
-                "Markdown (.md)": ".md",
-                "Text (.txt)": ".txt",
-                "CSV (.csv)": ".csv"
-            }
-            out_path = os.path.join(out_dir, base + ext_map[fmt])
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(markdown_text)
-            generated_files.append(out_path)
-
-        messagebox.showinfo(
-            "Completed",
-            "File generated successfully:\n\n" + "\n".join(generated_files)
+    # ---------------- FILE & FOLDER PICKING ---------------- #
+    def pick_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("PDF / Images", "*.pdf *.png *.jpg *.jpeg *.bmp *.tiff")]
         )
+        if path:
+            self.selected_file = path
+            self.file_label.config(text=f"Input File: {path}")
+            self.load_preview(path)
+            # We do NOT clear the output folder here, so previous selection remains valid.
 
-    except Exception as e:
-        messagebox.showerror("Processing Failed", str(e))
+    def pick_output_folder(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.output_folder = path
+            self.folder_label.config(text=f"Output Folder: {path}")
+            # We do NOT clear the input file or preview here.
+            # This ensures no conflict between input and output selection.
 
+    # ---------------- PREVIEW ---------------- #
+    def load_preview(self, path):
+        try:
+            if path.lower().endswith(".pdf"):
+                doc = fitz.open(path)
+                page = doc[0]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            else:
+                img = Image.open(path)
+                
+            self.original_image = img
+            self.update_preview()
+        except Exception as e:
+            messagebox.showerror("Preview Error", str(e))
 
-# =========================================================
-# UI
-# =========================================================
+    def update_preview(self):
+        if not self.original_image:
+            return
+        img = self.original_image.copy()
+        angle = int(self.rotation.get())
+        if angle:
+            img = img.rotate(-angle, expand=True)
+            
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        
+        if w <= 1 or h <= 1:
+            w, h = 400, 400
+            
+        img.thumbnail((w, h))
+        self.preview_image = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(w // 2, h // 2, image=self.preview_image, anchor="center")
 
-root = tk.Tk()
-root.title("Document Conversion Tool")
-root.resizable(False, False)
-center_window(root)
+    # ---------------- OCR PROCESS ---------------- #
+    def start_thread(self):
+        if not self.selected_file:
+            messagebox.showwarning("Missing Input", "Please select an input file.")
+            return
+        
+        self.progress.start()
+        self.start_btn.config(state="disabled")
+        threading.Thread(target=self.run_ocr, daemon=True).start()
 
-# Focus window
-root.update_idletasks()
-root.attributes("-topmost", True)
-root.focus_force()
-root.after(300, lambda: root.attributes("-topmost", False))
+    def run_ocr(self):
+        try:
+            converter = DocumentConverter()
+            
+            # Use the selected file
+            f = self.selected_file
+            
+            # Determine output path
+            # If output_folder is selected, use it. Otherwise, use input file's directory.
+            if self.output_folder:
+                out_dir = self.output_folder
+            else:
+                out_dir = os.path.dirname(f)
+            
+            # Prepare filenames
+            base_name = os.path.splitext(os.path.basename(f))[0]
+            
+            # Perform Conversion
+            result = converter.convert(f)
+            
+            # Handle Text Output
+            if self.output_fmt.get() == "txt":
+                out_path = os.path.join(out_dir, base_name + ".txt")
+                with open(out_path, "w", encoding="utf-8") as out:
+                    out.write(result.document.export_to_markdown())
+            
+            # Handle Excel Output
+            else:
+                out_path = os.path.join(out_dir, base_name + ".xlsx")
+                tables_found = False
+                with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+                    # 1. Export Tables
+                    for i, table in enumerate(result.document.tables):
+                        df = table.export_to_dataframe()
+                        sheet_name = f"Table_{i+1}"
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        tables_found = True
+                    
+                    # 2. Export Full Text if no tables found (or as backup)
+                    if not tables_found:
+                        full_text = result.document.export_to_markdown()
+                        df_text = pd.DataFrame({"Document Content": [full_text]})
+                        df_text.to_excel(writer, sheet_name="Full Text", index=False)
 
-BG = "#F4F4F4"
-FG = "#161616"
-BTN = "#0F62FE"
+            self.root.after(0, lambda: messagebox.showinfo("Done", f"Saved to:\n{out_path}"))
+        
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("OCR Error", str(e)))
+        finally:
+            self.root.after(0, self.stop_progress)
 
-root.configure(bg=BG)
+    def stop_progress(self):
+        self.progress.stop()
+        self.start_btn.config(state="normal")
 
-style = ttk.Style()
-style.theme_use("clam")
-style.configure("TLabel", background=BG, foreground=FG)
-style.configure("TEntry", foreground=FG)
-style.configure("TButton", background=BTN, foreground="white", font=("Segoe UI", 10, "bold"))
-
-input_var = tk.StringVar()
-output_var = tk.StringVar()
-format_var = tk.StringVar(value="Excel (.xlsx)")
-scanned_var = tk.BooleanVar(value=False)
-
-frame = tk.Frame(root, bg=BG)
-frame.pack(padx=30, pady=25)
-
-ttk.Label(frame, text="Input PDF / Image").grid(row=0, column=0, sticky="w")
-ttk.Entry(frame, textvariable=input_var, width=70).grid(row=1, column=0, padx=(0, 10))
-ttk.Button(frame, text="Browse", command=browse_file).grid(row=1, column=1)
-
-ttk.Label(frame, text="Output Folder").grid(row=2, column=0, sticky="w", pady=10)
-ttk.Entry(frame, textvariable=output_var, width=70).grid(row=3, column=0, padx=(0, 10))
-ttk.Button(frame, text="Browse", command=browse_output).grid(row=3, column=1)
-
-ttk.Label(frame, text="Output Format").grid(row=4, column=0, sticky="w", pady=10)
-ttk.Combobox(
-    frame,
-    textvariable=format_var,
-    values=["Excel (.xlsx)", "Markdown (.md)", "Text (.txt)", "CSV (.csv)"],
-    state="readonly",
-    width=22
-).grid(row=5, column=0, sticky="w")
-
-ttk.Checkbutton(
-    frame,
-    text="Scanned PDF Mode (High-Resolution OCR)",
-    variable=scanned_var
-).grid(row=6, column=0, sticky="w", pady=10)
-
-ttk.Button(frame, text="Convert Document", command=process_document)\
-    .grid(row=7, column=0, pady=25)
-
-root.mainloop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DoclingOCRApp(root)
+    root.mainloop()
