@@ -4,6 +4,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from datetime import datetime
+import threading
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -12,7 +13,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageTk
 import pandas as pd
 
-from openpyxl.utils import get_column_letter  # NEW: for autosizing
+from openpyxl.utils import get_column_letter  # for autosizing
 from docling.document_converter import DocumentConverter
 
 # Ensure UTF-8 console on Windows (best effort)
@@ -44,7 +45,7 @@ class DoclingOCRTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Docling OCR Utility")
-        self.root.geometry("1200x780")
+        self.root.geometry("1200x820")
 
         # State
         self.input_file: Path | None = None
@@ -57,13 +58,17 @@ class DoclingOCRTool:
         self.use_grayscale = tk.BooleanVar(value=False)  # grayscale during PDF rendering only
         self.output_format = tk.StringVar(value=OUTPUT_FORMATS[0])  # output format
 
-        # NEW: Excel layout controls
+        # Excel layout controls
         self.tables_single_sheet = tk.BooleanVar(value=True)  # toggle stacked layout
         self.blank_lines = tk.IntVar(value=1)                 # blank spacer rows between tables (stacked)
 
         # Preview
         self.original_image = None
         self.preview_image = None
+
+        # Progress helpers
+        self.total_steps = 0
+        self.current_step = 0
 
         self.build_ui()
 
@@ -92,7 +97,7 @@ class DoclingOCRTool:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.update_preview())
 
-        side = tk.Frame(body, width=340)
+        side = tk.Frame(body, width=360)
         side.pack(side="right", fill="y", padx=10)
 
         # Rotation
@@ -140,7 +145,7 @@ class DoclingOCRTool:
         )
         fmt_box.pack(fill="x")
 
-        # NEW: Excel layout controls
+        # Excel layout controls
         tk.Checkbutton(
             side,
             text="Stack all tables into one sheet (Excel)",
@@ -154,6 +159,14 @@ class DoclingOCRTool:
             spacer, from_=0, to=10, textvariable=self.blank_lines, width=6
         ).pack(anchor="w")
 
+        # Progress area (determinate)
+        prog_frame = tk.LabelFrame(side, text="Progress")
+        prog_frame.pack(fill="x", pady=(10, 6))
+        self.progress = ttk.Progressbar(prog_frame, mode="determinate")
+        self.progress.pack(fill="x", padx=8, pady=(6, 2))
+        self.progress_label = tk.Label(prog_frame, text="Idle", anchor="w")
+        self.progress_label.pack(fill="x", padx=8, pady=(0, 8))
+
         self.start_btn = tk.Button(
             side,
             text="Start OCR",
@@ -161,9 +174,6 @@ class DoclingOCRTool:
             command=self.start_ocr
         )
         self.start_btn.pack(fill="x", pady=12)
-
-        self.progress = ttk.Progressbar(side, mode="indeterminate")
-        self.progress.pack(fill="x")
 
         # Hint
         tk.Label(
@@ -176,8 +186,36 @@ class DoclingOCRTool:
             ),
             foreground="#444",
             justify="left",
-            wraplength=310
+            wraplength=330
         ).pack(anchor="w", pady=8)
+
+    # ---------------- Progress helpers (thread-safe) ---------------- #
+
+    def _set_progress_total(self, total: int):
+        # Called from worker thread; marshal to UI
+        def _apply():
+            self.total_steps = max(1, total)
+            self.current_step = 0
+            self.progress["maximum"] = self.total_steps
+            self.progress["value"] = 0
+            self.progress_label.config(text=f"Starting (0/{self.total_steps})")
+        self.root.after(0, _apply)
+
+    def _advance_progress(self, step: int = 1, status: str | None = None):
+        # Called from worker thread; marshal to UI
+        def _apply():
+            self.current_step = min(self.total_steps, self.current_step + step)
+            self.progress["value"] = self.current_step
+            if status:
+                self.progress_label.config(text=f"{status} ({self.current_step}/{self.total_steps})")
+            else:
+                self.progress_label.config(text=f"Working... ({self.current_step}/{self.total_steps})")
+        self.root.after(0, _apply)
+
+    def _set_status(self, status: str):
+        def _apply():
+            self.progress_label.config(text=status)
+        self.root.after(0, _apply)
 
     # ---------------- File Selection ---------------- #
 
@@ -240,59 +278,145 @@ class DoclingOCRTool:
             messagebox.showerror("Missing Input", "Select input file and output folder")
             return
 
-        self.progress.start()
         self.start_btn.config(state="disabled")
-        self.root.after(100, self.run_ocr)
+        self._set_status("Preparing…")
 
-    def run_ocr(self):
+        # Run on a background thread to keep UI responsive
+        worker = threading.Thread(target=self.run_ocr_worker, daemon=True)
+        worker.start()
+
+    def run_ocr_worker(self):
         temp_paths = []   # collect temp dirs for cleanup
         created_files = []
         try:
             converter = DocumentConverter()
             suffix = self.input_file.suffix.lower()
 
+            # ---- Compute total steps for progress bar ----
+            # We'll count "meaningful units":
+            #   Images: prep(1) + OCR(3) + export(2) = 6 steps total
+            #   Digital PDFs: OCR(3) + export(2) = 5 steps
+            #   Scanned PDFs: For N pages => render(N) + ocr(N) + export(2)
+            total_steps = 0
+            if suffix in IMAGE_EXTS:
+                total_steps = 6
+            elif suffix in PDF_EXTS and self.is_scanned.get():
+                # count pages
+                try:
+                    doc = fitz.open(self.input_file)
+                    n_pages = len(doc)
+                except Exception:
+                    n_pages = 1
+                total_steps = n_pages + n_pages + 2  # render + ocr + export
+            else:
+                total_steps = 5  # digital PDFs
+
+            self._set_progress_total(total_steps)
+
             # 1) Images: apply ONLY rotation + DPI, then OCR
             if suffix in IMAGE_EXTS:
+                self._set_status("Preparing image (rotation + DPI)…")
                 temp_dir, prepped_image = self.prepare_image_temp(self.input_file)
                 temp_paths.append(temp_dir)
+                self._advance_progress(1, "Prepared image")
+
+                self._set_status("Running OCR on image…")
                 result = converter.convert(str(prepped_image))
+                # give OCR more weight to feel responsive
+                self._advance_progress(3, "OCR complete")
+
+                self._set_status("Exporting output…")
                 created_files = self.export_by_selected_format(result)
+                self._advance_progress(2, "Export complete")
 
             # 2) Scanned PDFs: render at high DPI to TIFF, OCR each
             elif suffix in PDF_EXTS and self.is_scanned.get():
-                temp_dir = self.pdf_to_tiff_temp(self.input_file)
+                self._set_status("Rendering scanned PDF pages…")
+                # First pass: render and progress per page
+                # We reimplement rendering here to get per-page progress signals
+                doc = fitz.open(self.input_file)
+
+                try:
+                    dpi = int(self.ocr_dpi.get())
+                except Exception:
+                    dpi = 300
+                zoom = dpi / 72.0
+                matrix = fitz.Matrix(zoom, zoom)
+
+                angle = int(self.rotation.get())
+                to_gray = self.use_grayscale.get()
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                temp_dir = Path(tempfile.gettempdir()) / f"OCR_{timestamp}"
+                temp_dir.mkdir(parents=True, exist_ok=True)
                 temp_paths.append(temp_dir)
 
+                # Render pages
+                for i, page in enumerate(doc, start=1):
+                    try:
+                        pix = page.get_pixmap(dpi=dpi, alpha=False)  # PyMuPDF >= 1.23
+                    except TypeError:
+                        pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    if angle:
+                        img = img.rotate(-angle, expand=True)
+                    if to_gray:
+                        img = img.convert("L")
+
+                    img.save(
+                        temp_dir / f"page_{i:03}.tiff",
+                        format="TIFF",
+                        compression="tiff_lzw",
+                        dpi=(dpi, dpi),
+                    )
+                    self._advance_progress(1, f"Rendered page {i}/{len(doc)}")
+
+                # OCR each page
                 texts, tables = [], []
                 image_files = sorted(temp_dir.glob("*.tiff"))
                 if not image_files:
                     raise RuntimeError("No TIFF images generated for OCR")
 
-                for img_path in image_files:
+                for idx, img_path in enumerate(image_files, start=1):
+                    self._set_status(f"OCR on page {idx}/{len(image_files)}…")
                     r = converter.convert(str(img_path))
                     texts.append(r.document.export_to_markdown())
                     if r.document.tables:
                         tables.extend(r.document.tables)
+                    self._advance_progress(1, f"OCR page {idx}/{len(image_files)}")
 
                 combined_result = CombinedResult(texts=texts, tables=tables)
+
+                self._set_status("Exporting output…")
                 created_files = self.export_by_selected_format(combined_result)
+                self._advance_progress(2, "Export complete")
 
             # 3) Digital PDFs: let Docling handle directly
             else:
+                self._set_status("Running OCR on PDF…")
                 result = converter.convert(str(self.input_file))
+                self._advance_progress(3, "OCR complete")
+
+                self._set_status("Exporting output…")
                 created_files = self.export_by_selected_format(result)
+                self._advance_progress(2, "Export complete")
 
             # Build message
             file_list = "\n".join(str(p) for p in created_files)
-            messagebox.showinfo(
-                "Completed",
-                f"OCR Completed Successfully!\n\n"
-                f"Input File:\n{self.input_file}\n\n"
-                f"Generated File(s):\n{file_list}"
-            )
+            def _done():
+                messagebox.showinfo(
+                    "Completed",
+                    f"OCR Completed Successfully!\n\n"
+                    f"Input File:\n{self.input_file}\n\n"
+                    f"Generated File(s):\n{file_list}"
+                )
+            self.root.after(0, _done)
 
         except Exception as err:
-            messagebox.showerror("OCR Error", str(err))
+            def _err():
+                messagebox.showerror("OCR Error", str(err))
+            self.root.after(0, _err)
 
         finally:
             for p in temp_paths:
@@ -301,8 +425,14 @@ class DoclingOCRTool:
                         shutil.rmtree(p, ignore_errors=True)
                 except Exception:
                     pass
-            self.progress.stop()
-            self.start_btn.config(state="normal")
+
+            def _restore():
+                self.start_btn.config(state="normal")
+                # finalize progress state
+                if self.current_step < self.total_steps:
+                    self.progress["value"] = self.total_steps
+                    self.progress_label.config(text=f"Done ({self.total_steps}/{self.total_steps})")
+            self.root.after(0, _restore)
 
     # ---------------- Image prep: Rotation + DPI ---------------- #
 
@@ -371,7 +501,7 @@ class DoclingOCRTool:
     # ---------------- PDF → TIFF (High‑DPI) ---------------- #
 
     def pdf_to_tiff_temp(self, pdf_path: Path) -> Path:
-        """Render each page of a scanned PDF to high‑DPI, lossless TIFFs."""
+        """(Unused now for progress granularity—kept for reference)"""
         doc = fitz.open(pdf_path)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         temp_dir = Path(tempfile.gettempdir()) / f"OCR_{timestamp}"
@@ -456,7 +586,6 @@ class DoclingOCRTool:
         """
         Auto-size columns in an openpyxl worksheet based on max cell text length.
         """
-        # Iterate through all columns and compute max length
         for col_idx in range(1, ws.max_column + 1):
             max_len = 0
             for row in range(1, ws.max_row + 1):
@@ -586,11 +715,8 @@ class DoclingOCRTool:
                 )
 
             # ---------- Autosize all sheets ----------
-            # Must access after data is written
-            # Text sheet
             ws_text = writer.sheets["Text"]
             self._autosize_columns(ws_text)
-            # Tables (if created)
             ws_tables = writer.sheets[sheet_name]
             self._autosize_columns(ws_tables)
 
@@ -686,19 +812,16 @@ class DoclingOCRTool:
 
         # Single document
         if result.document.tables:
-            # Tables
             for i, table in enumerate(result.document.tables, start=1):
                 df = table.export_to_dataframe()
                 table_csv = output_dir / f"{self.input_file.stem}_Table_{i}.csv"
                 df.to_csv(table_csv, index=False, encoding="utf-8")
                 created.append(table_csv)
-            # Text
             text = result.document.export_to_markdown()
             text_csv = output_dir / f"{self.input_file.stem}_Text.csv"
             pd.DataFrame({"Document Text": [text]}).to_csv(text_csv, index=False, encoding="utf-8")
             created.append(text_csv)
         else:
-            # Only text
             text = result.document.export_to_markdown()
             text_csv = output_dir / f"{self.input_file.stem}_Text.csv"
             pd.DataFrame({"Document Text": [text]}).to_csv(text_csv, index=False, encoding="utf-8")
