@@ -12,6 +12,7 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageTk
 import pandas as pd
 
+from openpyxl.utils import get_column_letter  # NEW: for autosizing
 from docling.document_converter import DocumentConverter
 
 # Ensure UTF-8 console on Windows (best effort)
@@ -43,7 +44,7 @@ class DoclingOCRTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Docling OCR Utility")
-        self.root.geometry("1200x760")
+        self.root.geometry("1200x780")
 
         # State
         self.input_file: Path | None = None
@@ -54,7 +55,11 @@ class DoclingOCRTool:
         self.ocr_dpi = tk.StringVar(value="300")       # target DPI for images & scanned PDFs
         self.is_scanned = tk.BooleanVar(value=False)   # scanned PDF indicator
         self.use_grayscale = tk.BooleanVar(value=False)  # grayscale during PDF rendering only
-        self.output_format = tk.StringVar(value=OUTPUT_FORMATS[0])  # NEW: output format
+        self.output_format = tk.StringVar(value=OUTPUT_FORMATS[0])  # output format
+
+        # NEW: Excel layout controls
+        self.tables_single_sheet = tk.BooleanVar(value=True)  # toggle stacked layout
+        self.blank_lines = tk.IntVar(value=1)                 # blank spacer rows between tables (stacked)
 
         # Preview
         self.original_image = None
@@ -87,7 +92,7 @@ class DoclingOCRTool:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.update_preview())
 
-        side = tk.Frame(body, width=320)
+        side = tk.Frame(body, width=340)
         side.pack(side="right", fill="y", padx=10)
 
         # Rotation
@@ -125,7 +130,7 @@ class DoclingOCRTool:
             variable=self.use_grayscale
         ).pack(anchor="w", pady=(4, 10))
 
-        # Output format dropdown (NEW)
+        # Output format dropdown
         tk.Label(side, text="Output Format").pack(anchor="w", pady=(8, 0))
         fmt_box = ttk.Combobox(
             side,
@@ -135,13 +140,27 @@ class DoclingOCRTool:
         )
         fmt_box.pack(fill="x")
 
+        # NEW: Excel layout controls
+        tk.Checkbutton(
+            side,
+            text="Stack all tables into one sheet (Excel)",
+            variable=self.tables_single_sheet
+        ).pack(anchor="w", pady=(10, 4))
+
+        spacer = tk.Frame(side)
+        spacer.pack(anchor="w", pady=(0, 8), fill="x")
+        tk.Label(spacer, text="Spacer blank rows between tables (Excel):").pack(anchor="w")
+        tk.Spinbox(
+            spacer, from_=0, to=10, textvariable=self.blank_lines, width=6
+        ).pack(anchor="w")
+
         self.start_btn = tk.Button(
             side,
             text="Start OCR",
             height=2,
             command=self.start_ocr
         )
-        self.start_btn.pack(fill="x", pady=14)
+        self.start_btn.pack(fill="x", pady=12)
 
         self.progress = ttk.Progressbar(side, mode="indeterminate")
         self.progress.pack(fill="x")
@@ -150,14 +169,14 @@ class DoclingOCRTool:
         tk.Label(
             side,
             text=(
-                "Images: apply Rotation + DPI (with upscaling if needed), then send to OCR.\n"
+                "Images: apply Rotation + DPI (with upscaling if needed), then OCR.\n"
                 "Scanned PDFs: render pages at target DPI.\n"
                 "Digital PDFs: processed directly.\n"
-                "CSV may produce multiple files (text + tables)."
+                "Excel: choose stacked vs multi-sheet; autosizing applied."
             ),
             foreground="#444",
             justify="left",
-            wraplength=300
+            wraplength=310
         ).pack(anchor="w", pady=8)
 
     # ---------------- File Selection ---------------- #
@@ -397,7 +416,10 @@ class DoclingOCRTool:
     def export_by_selected_format(self, result):
         fmt = self.output_format.get()
         if fmt.startswith("Excel"):
-            return [self.export_to_excel(result)]
+            if self.tables_single_sheet.get():
+                return [self.export_to_excel_stacked(result)]
+            else:
+                return [self.export_to_excel_multi(result)]
         elif fmt.startswith("Markdown"):
             return [self.export_to_markdown(result)]
         elif fmt.startswith("Plain Text"):
@@ -405,8 +427,8 @@ class DoclingOCRTool:
         elif fmt.startswith("CSV"):
             return self.export_to_csv(result)
         else:
-            # Fallback to Excel
-            return [self.export_to_excel(result)]
+            # Fallback to Excel stacked
+            return [self.export_to_excel_stacked(result)]
 
     # ---------------- Helpers: Formatting ---------------- #
 
@@ -429,43 +451,152 @@ class DoclingOCRTool:
             rows.append("| " + " | ".join(cells) + " |")
         return header + align + "\n".join(rows)
 
-    # ---------------- Exporters ---------------- #
+    @staticmethod
+    def _autosize_columns(ws, max_width=60):
+        """
+        Auto-size columns in an openpyxl worksheet based on max cell text length.
+        """
+        # Iterate through all columns and compute max length
+        for col_idx in range(1, ws.max_column + 1):
+            max_len = 0
+            for row in range(1, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col_idx)
+                val = "" if cell.value is None else str(cell.value)
+                if len(val) > max_len:
+                    max_len = len(val)
+            adj = min(max_len + 2, max_width)
+            ws.column_dimensions[get_column_letter(col_idx)].width = adj
+
+    # ---------------- Exporters: Excel ---------------- #
 
     def _default_output_dir(self) -> Path:
         return self.output_folder if (self.output_folder and self.output_folder.exists()) else (Path.home() / "Documents")
 
-    def export_to_excel(self, result):
-        """Export result to a single Excel .xlsx file (returns Path)."""
+    def export_to_excel_multi(self, result: CombinedResult | object):
+        """
+        Excel exporter: original behavior (one sheet per table + 'Text' sheet).
+        Autosizes columns in each sheet.
+        """
         output_dir = self._default_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         out_file = output_dir / f"{self.input_file.stem}.xlsx"
 
-        # CombinedResult (multi-page)
-        if isinstance(result, CombinedResult):
-            with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+        with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+            # Write tables
+            if isinstance(result, CombinedResult):
                 if result.tables:
-                    for i, table in enumerate(result.tables):
+                    for i, table in enumerate(result.tables, start=1):
                         df = table.export_to_dataframe()
-                        df.to_excel(writer, sheet_name=f"Table_{i+1}", index=False)
-
+                        sheet = f"Table_{i}"
+                        df.to_excel(writer, sheet_name=sheet, index=False)
+                        ws = writer.sheets[sheet]
+                        self._autosize_columns(ws)
+                # Text
                 all_text = "\n\n".join(result.texts) if result.texts else ""
                 pd.DataFrame({"Document Text": [all_text]}).to_excel(writer, sheet_name="Text", index=False)
-
-            return out_file
-
-        # Single document
-        if result.document.tables:
-            with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
-                for i, table in enumerate(result.document.tables):
-                    df = table.export_to_dataframe()
-                    df.to_excel(writer, sheet_name=f"Table_{i+1}", index=False)
-                text = result.document.export_to_markdown()
-                pd.DataFrame({"Document Text": [text]}).to_excel(writer, sheet_name="Text", index=False)
-        else:
-            text = result.document.export_to_markdown()
-            pd.DataFrame({"Document Text": [text]}).to_excel(out_file, index=False)
+                self._autosize_columns(writer.sheets["Text"])
+            else:
+                if result.document.tables:
+                    for i, table in enumerate(result.document.tables, start=1):
+                        df = table.export_to_dataframe()
+                        sheet = f"Table_{i}"
+                        df.to_excel(writer, sheet_name=sheet, index=False)
+                        ws = writer.sheets[sheet]
+                        self._autosize_columns(ws)
+                    text = result.document.export_to_markdown()
+                    pd.DataFrame({"Document Text": [text]}).to_excel(writer, sheet_name="Text", index=False)
+                    self._autosize_columns(writer.sheets["Text"])
+                else:
+                    text = result.document.export_to_markdown()
+                    pd.DataFrame({"Document Text": [text]}).to_excel(writer, sheet_name="Text", index=False)
+                    self._autosize_columns(writer.sheets["Text"])
 
         return out_file
+
+    def export_to_excel_stacked(self, result: CombinedResult | object):
+        """
+        Excel exporter: stack all tables in a single sheet ('Tables') one after another,
+        with a title row and a configurable number of blank spacer rows between tables.
+        Adds a 'TableId' column to each table block for easier filtering.
+        Also writes a 'Text' sheet. Autosizes all sheets.
+        """
+        output_dir = self._default_output_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_file = output_dir / f"{self.input_file.stem}.xlsx"
+
+        # Helper: write a block with title + table at a specific start row; return next start row.
+        def write_table_block(writer, df: pd.DataFrame, sheet_name: str, startrow: int, table_index: int, spacer_rows: int):
+            # Ensure a TableId column (avoid duplicates)
+            col_name = "TableId"
+            if col_name in df.columns:
+                suffix = 1
+                while f"{col_name}_{suffix}" in df.columns:
+                    suffix += 1
+                col_name = f"{col_name}_{suffix}"
+            df_block = df.copy()
+            df_block.insert(0, col_name, table_index)
+
+            # Title row (one-row DataFrame)
+            title_text = f"Table {table_index}"
+            pd.DataFrame({title_text: [""]}).to_excel(
+                writer, sheet_name=sheet_name, startrow=startrow, index=False, header=False
+            )
+            # Data with header under the title
+            df_block.to_excel(
+                writer, sheet_name=sheet_name, startrow=startrow + 1, index=False
+            )
+            # Compute next starting row: title (1) + header (1) + nrows + spacer
+            next_start = startrow + 1 + 1 + len(df_block.index) + spacer_rows
+            return next_start
+
+        blank = max(0, int(self.blank_lines.get()))
+
+        with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+            # ---------- TEXT SHEET ----------
+            if isinstance(result, CombinedResult):
+                all_text = "\n\n".join(result.texts) if result.texts else ""
+            else:
+                all_text = result.document.export_to_markdown()
+            pd.DataFrame({"Document Text": [all_text]}).to_excel(
+                writer, sheet_name="Text", index=False
+            )
+
+            # ---------- TABLES SHEET ----------
+            any_tables = False
+            cur_row = 0
+            sheet_name = "Tables"
+
+            if isinstance(result, CombinedResult):
+                if result.tables:
+                    any_tables = True
+                    for i, table in enumerate(result.tables, start=1):
+                        df = table.export_to_dataframe()
+                        cur_row = write_table_block(writer, df, sheet_name, cur_row, i, blank)
+            else:
+                if result.document.tables:
+                    any_tables = True
+                    for i, table in enumerate(result.document.tables, start=1):
+                        df = table.export_to_dataframe()
+                        cur_row = write_table_block(writer, df, sheet_name, cur_row, i, blank)
+
+            # If no tables, still create a Tables sheet with a note
+            if not any_tables:
+                pd.DataFrame({"Info": ["No tables detected"]}).to_excel(
+                    writer, sheet_name=sheet_name, index=False
+                )
+
+            # ---------- Autosize all sheets ----------
+            # Must access after data is written
+            # Text sheet
+            ws_text = writer.sheets["Text"]
+            self._autosize_columns(ws_text)
+            # Tables (if created)
+            ws_tables = writer.sheets[sheet_name]
+            self._autosize_columns(ws_tables)
+
+        return out_file
+
+    # ---------------- Exporters: Other Formats ---------------- #
 
     def export_to_markdown(self, result):
         """Export result to a single Markdown .md file (returns Path)."""
@@ -498,8 +629,7 @@ class DoclingOCRTool:
     def export_to_text(self, result):
         """
         Export result to a single .txt file.
-        We preserve structure by writing the same Markdown‑styled content
-        (works well in plain text viewers).
+        We preserve structure by writing the same Markdown‑styled content.
         """
         output_dir = self._default_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
