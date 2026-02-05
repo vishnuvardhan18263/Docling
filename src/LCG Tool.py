@@ -21,9 +21,6 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-# from docling.document_converter import DocumentConverter
-
-
 # ---------- Constants ----------
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 PDF_EXTS = {".pdf"}
@@ -31,15 +28,18 @@ ALL_EXTS = IMAGE_EXTS.union(PDF_EXTS)
 
 VALID_OUTPUT_FORMATS = {"Excel", "Markdown", "Text", "CSV"}
 
+# --- Patch importlib.metadata.version for some PyInstaller edge cases ---
 import importlib.metadata
 
 _real_version = importlib.metadata.version
+
 
 def safe_version(pkg):
     try:
         return _real_version(pkg)
     except importlib.metadata.PackageNotFoundError:
         return "0.0.0"
+
 
 importlib.metadata.version = safe_version
 
@@ -50,7 +50,7 @@ from docling.document_converter import DocumentConverter
 @dataclass
 class Config:
     workbook_path: Path
-    sheet_name: str = "Exe config"
+    sheet_name: str = "Inffo"
 
     # Inputs
     input_mode: str = "file"  # file | folder | list
@@ -144,7 +144,7 @@ def _read_bool(s: Optional[str], default=False) -> bool:
 
 def _read_int(s: Optional[str], default=0, lo=None, hi=None) -> int:
     try:
-        x = int(s)
+        x = int(str(s).strip())
     except Exception:
         x = default
     if lo is not None:
@@ -154,7 +154,57 @@ def _read_int(s: Optional[str], default=0, lo=None, hi=None) -> int:
     return x
 
 
-def load_config_from_excel(workbook_path: Path, sheet_name="Exe config") -> Config:
+def _clean_path_string(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if not s:
+        return ""
+    return s.strip().strip('"').strip("'")
+
+
+def _kv_get(kv: Dict[str, str], *keys: str, default: str = "") -> str:
+    """
+    Try multiple key aliases. Returns first non-empty.
+    """
+    for k in keys:
+        if k in kv and str(kv[k]).strip() != "":
+            return str(kv[k]).strip()
+    return default
+
+
+def dump_config_to_log(cfg: Config, logger: logging.Logger):
+    logger.info("---------- CONFIG DUMP BEGIN ----------")
+    logger.info("Workbook: %s", cfg.workbook_path)
+    logger.info("Sheet: %s", cfg.sheet_name)
+
+    logger.info("Input mode: %s", cfg.input_mode)
+    logger.info("Input folder: %s", cfg.input_folder if cfg.input_folder else "")
+    logger.info("Recurse subfolders: %s", cfg.recurse_subfolders)
+
+    if cfg.input_files:
+        logger.info("Input files (%d):", len(cfg.input_files))
+        for p in cfg.input_files:
+            logger.info("  - %s", p)
+    else:
+        logger.info("Input files: (none)")
+
+    logger.info("Output folder: %s", cfg.output_folder if cfg.output_folder else "")
+    logger.info("Output formats: %s", ", ".join(cfg.output_formats))
+
+    logger.info("DPI: %s", cfg.dpi)
+    logger.info("Orientation: %s", cfg.orientation)
+    logger.info("Scanned PDF: %s", cfg.is_scanned_pdf)
+    logger.info("Grayscale: %s", cfg.grayscale)
+
+    logger.info("Excel tables single sheet: %s", cfg.tables_single_sheet)
+    logger.info("Excel blank lines: %s", cfg.blank_lines)
+
+    logger.info("Write RunLog back: %s", cfg.write_back_runlog)
+    logger.info("---------- CONFIG DUMP END ------------")
+
+
+def load_config_from_excel(workbook_path: Path, sheet_name="Info") -> Config:
     # keep_vba=True preserves macros if we later save; data_only to read computed values
     wb = load_workbook(workbook_path, data_only=True, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     if sheet_name not in wb.sheetnames:
@@ -162,71 +212,148 @@ def load_config_from_excel(workbook_path: Path, sheet_name="Exe config") -> Conf
 
     ws = wb[sheet_name]
 
-    # Read Key-Value block (A=Key, B=Value) — stop on empty key
+    # Read Key-Value block (A=Key, B=Value)
+    # IMPORTANT FIX:
+    # - Old code stopped at first empty key
+    # - Now we SKIP blanks and continue
     kv: Dict[str, str] = {}
     for row in ws.iter_rows(min_row=1, max_col=2):
         key_cell, val_cell = row[0], row[1]
         key = (key_cell.value or "").strip() if key_cell.value else ""
         if not key:
-            # stop when first empty key is encountered (allows space for other sections below)
-            break
+            continue  # <-- FIX: don't break
         kv[key] = "" if val_cell.value is None else str(val_cell.value).strip()
 
     cfg = Config(workbook_path=workbook_path, sheet_name=sheet_name)
 
-    cfg.input_mode = kv.get("InputMode", cfg.input_mode).strip().lower()
-    if cfg.input_mode not in {"file", "folder", "list"}:
-        raise RuntimeError("InputMode must be one of: file, folder, list")
+    # ----------------------------
+    # Support BOTH old + new keys
+    # ----------------------------
 
-    # Input paths
-    input_files_cell = kv.get("InputFiles", "")
+    # Input mode
+    cfg.input_mode = _kv_get(
+        kv,
+        "Input Mode",
+        "InputMode",
+        default=cfg.input_mode
+    ).strip().lower()
+
+    if cfg.input_mode not in {"file", "folder", "list"}:
+        raise RuntimeError("Input Mode must be one of: file, folder, list")
+
+    # Input file (single)
+    single_file_cell = _kv_get(
+        kv,
+        "Input File (single file)",
+        "InputFile",
+        "Input File",
+        default=""
+    )
+    if single_file_cell:
+        p = _clean_path_string(single_file_cell)
+        if p:
+            cfg.input_files.append(Path(p))
+
+    # Input files (multi) - semicolon separated
+    input_files_cell = _kv_get(
+        kv,
+        "InputFiles",
+        "Input Files",
+        "Input File List",
+        default=""
+    )
     if input_files_cell:
-        for part in input_files_cell.split(";"):
-            p = part.strip().strip('"')
+        for part in str(input_files_cell).split(";"):
+            p = _clean_path_string(part)
             if p:
                 cfg.input_files.append(Path(p))
 
-    folder_cell = kv.get("InputFolder", "")
+    # Input folder
+    folder_cell = _kv_get(
+        kv,
+        "Input Folder",
+        "InputFolder",
+        default=""
+    )
     if folder_cell:
-        cfg.input_folder = Path(folder_cell.strip().strip('"'))
+        cfg.input_folder = Path(_clean_path_string(folder_cell))
 
-    cfg.recurse_subfolders = _read_bool(kv.get("RecurseSubfolders", "FALSE"), default=False)
+    # Recurse
+    cfg.recurse_subfolders = _read_bool(
+        _kv_get(kv, "Recurse Subfolders", "RecurseSubfolders", default="FALSE"),
+        default=False
+    )
 
-    # Output
-    out_cell = kv.get("OutputFolder", "")
-    cfg.output_folder = Path(out_cell.strip().strip('"')) if out_cell else None
+    # Output folder
+    out_cell = _kv_get(
+        kv,
+        "Output Folder",
+        "OutputFolder",
+        default=""
+    )
+    cfg.output_folder = Path(_clean_path_string(out_cell)) if out_cell else None
 
-    formats_cell = kv.get("OutputFormats", "")
+    # Output formats
+    formats_cell = _kv_get(
+        kv,
+        "Output Formats",
+        "OutputFormats",
+        default=""
+    )
     if formats_cell:
-        fmts = [f.strip().capitalize() for f in formats_cell.split(",") if f.strip()]
-        # Normalize to the expected labels
+        fmts = [f.strip() for f in formats_cell.split(",") if f.strip()]
         norm = []
         for f in fmts:
-            if f.lower().startswith("excel"):
+            fl = f.lower()
+            if fl.startswith("excel"):
                 norm.append("Excel")
-            elif f.lower() in {"md", "markdown"}:
+            elif fl in {"md", "markdown"}:
                 norm.append("Markdown")
-            elif f.lower() in {"txt", "text"}:
+            elif fl in {"txt", "text"}:
                 norm.append("Text")
-            elif f.lower() == "csv":
+            elif fl == "csv":
                 norm.append("CSV")
         cfg.output_formats = norm or cfg.output_formats
 
-    # OCR/Render
-    cfg.dpi = _read_int(kv.get("DPI"), default=300, lo=72, hi=1200)
-    cfg.orientation = _read_int(kv.get("Orientation"), default=0)
+    # DPI
+    cfg.dpi = _read_int(_kv_get(kv, "DPI", default="300"), default=300, lo=72, hi=1200)
+
+    # Orientation
+    cfg.orientation = _read_int(
+        _kv_get(kv, "Orientation (Rotation)", "Orientation", default="0"),
+        default=0
+    )
     if cfg.orientation not in {0, 90, 180, 270}:
         cfg.orientation = 0
 
-    cfg.is_scanned_pdf = _read_bool(kv.get("IsScannedPDF", "FALSE"), default=False)
-    cfg.grayscale = _read_bool(kv.get("Grayscale", "FALSE"), default=False)
+    # Scanned PDF
+    cfg.is_scanned_pdf = _read_bool(
+        _kv_get(kv, "Scanned PDF", "IsScannedPDF", default="FALSE"),
+        default=False
+    )
+
+    # Grayscale
+    cfg.grayscale = _read_bool(
+        _kv_get(kv, "Grayscale (PDF only)", "Grayscale", default="FALSE"),
+        default=False
+    )
 
     # Excel layout
-    cfg.tables_single_sheet = _read_bool(kv.get("ExcelTablesSingleSheet", "TRUE"), default=True)
-    cfg.blank_lines = _read_int(kv.get("ExcelBlankLines", "1"), default=1, lo=0, hi=50)
+    cfg.tables_single_sheet = _read_bool(
+        _kv_get(kv, "Excel: Tables Single Sheet", "ExcelTablesSingleSheet", default="TRUE"),
+        default=True
+    )
 
-    # Post-run
-    cfg.write_back_runlog = _read_bool(kv.get("WriteBackRunLog", "TRUE"), default=True)
+    cfg.blank_lines = _read_int(
+        _kv_get(kv, "Excel: Blank Lines Between Tables", "ExcelBlankLines", default="1"),
+        default=1, lo=0, hi=50
+    )
+
+    # Write RunLog back
+    cfg.write_back_runlog = _read_bool(
+        _kv_get(kv, "Write Run Log Back to Excel", "WriteBackRunLog", default="TRUE"),
+        default=True
+    )
 
     # Additionally scan for an "Inputs" table with header "InputPath"
     header_row = None
@@ -235,16 +362,17 @@ def load_config_from_excel(workbook_path: Path, sheet_name="Exe config") -> Conf
         if cell.value and str(cell.value).strip().lower() == "inputpath":
             header_row = cell.row
             break
+
     if header_row:
         r = header_row + 1
         while True:
             v = ws.cell(row=r, column=1).value
             if v is None or str(v).strip() == "":
                 break
-            cfg.input_files.append(Path(str(v).strip().strip('"')))
+            cfg.input_files.append(Path(_clean_path_string(str(v))))
             r += 1
 
-    # De-duplicate files if any duplicates from both sources
+    # De-duplicate input files
     if cfg.input_files:
         dedup = []
         seen = set()
@@ -301,6 +429,7 @@ class DoclingHeadless:
     def _df_to_markdown(df: pd.DataFrame) -> str:
         def esc(x: str) -> str:
             return ("" if x is None else str(x)).replace("|", "\\|")
+
         cols = [esc(c) for c in df.columns]
         header = "| " + " | ".join(cols) + " |\n"
         align = "| " + " | ".join(["---"] * len(cols)) + " |\n"
@@ -400,6 +529,7 @@ class DoclingHeadless:
                 all_text = "\n\n".join(result.texts) if result.texts else ""
             else:
                 all_text = result.document.export_to_markdown()
+
             pd.DataFrame({"Document Text": [all_text]}).to_excel(writer, sheet_name="Text", index=False)
 
             any_tables = False
@@ -505,7 +635,6 @@ class DoclingHeadless:
 
     # ---- Convert: PDF scanned pipeline ----
     def convert_scanned_pdf(self, pdf_path: Path, dpi: int, rotation: int, grayscale: bool):
-        created_files: List[Path] = []
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         temp_dir = Path(tempfile.gettempdir()) / f"OCR_{timestamp}"
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -513,19 +642,22 @@ class DoclingHeadless:
 
         doc = fitz.open(pdf_path)
         try:
-            n_pages = len(doc)
             for i, page in enumerate(doc, start=1):
+                img = None
                 try:
                     try:
-                        pix = page.get_pixmap(dpi=dpi, alpha=False)  # modern PyMuPDF
+                        pix = page.get_pixmap(dpi=dpi, alpha=False)
                     except TypeError:
                         zoom = dpi / 72.0
                         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
                     if rotation:
                         img = img.rotate(-rotation, expand=True)
                     if grayscale:
                         img = img.convert("L")
+
                     img.save(
                         temp_dir / f"page_{i:03}.tiff",
                         format="TIFF",
@@ -534,7 +666,8 @@ class DoclingHeadless:
                     )
                 finally:
                     try:
-                        img.close()
+                        if img is not None:
+                            img.close()
                     except Exception:
                         pass
         finally:
@@ -566,18 +699,20 @@ class DoclingHeadless:
         created: List[Path] = []
 
         if suffix in IMAGE_EXTS:
-            # Prepare and OCR as image
             prepped = self.prepare_image_temp(input_file, rotation=self.cfg.orientation, dpi=self.cfg.dpi)
             res = self.converter.convert(str(prepped))
             created.extend(self._export_all_formats(res, input_file, output_root))
 
         elif suffix in PDF_EXTS and self.cfg.is_scanned_pdf:
-            # Scanned PDF pipeline
-            res = self.convert_scanned_pdf(input_file, dpi=self.cfg.dpi, rotation=self.cfg.orientation, grayscale=self.cfg.grayscale)
+            res = self.convert_scanned_pdf(
+                input_file,
+                dpi=self.cfg.dpi,
+                rotation=self.cfg.orientation,
+                grayscale=self.cfg.grayscale
+            )
             created.extend(self._export_all_formats(res, input_file, output_root))
 
         else:
-            # Digital PDF: convert directly
             res = self.converter.convert(str(input_file))
             created.extend(self._export_all_formats(res, input_file, output_root))
 
@@ -601,62 +736,81 @@ class DoclingHeadless:
 
 
 # ---------- RunLog writer ----------
-def append_runlog_to_workbook(cfg: Config, rows: List[Dict[str, str]]):
-    # Preserve macros when saving back to .xlsm
-    keep_vba = cfg.workbook_path.suffix.lower() == ".xlsm"
-    wb = load_workbook(cfg.workbook_path, keep_vba=keep_vba)
-    sheet_name = "RunLog"
-    if sheet_name not in wb.sheetnames:
-        ws = wb.create_sheet(sheet_name)
-        headers = ["Timestamp", "Input", "Status", "Outputs (semicolon-separated)", "Error", "LogFile"]
-        ws.append(headers)
-    else:
-        ws = wb[sheet_name]
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from datetime import datetime
 
-    for row in rows:
-        ws.append([
-            row.get("Timestamp", ""),
-            row.get("Input", ""),
-            row.get("Status", ""),
-            row.get("Outputs", ""),
-            row.get("Error", ""),
-            row.get("LogFile", ""),
-        ])
+def write_runlog_file(cfg: Config, rows: List[Dict[str, str]], output_dir: Path, session_id: str) -> Path:
+    """
+    Writes a RunLog into a normal .log file.
+    """
 
-    # Auto-size columns
-    for col_idx in range(1, ws.max_column + 1):
-        max_len = 0
-        for r in range(1, ws.max_row + 1):
-            val = ws.cell(row=r, column=col_idx).value
-            s = "" if val is None else str(val)
-            max_len = max(max_len, len(s))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
+    runlog_path = output_dir / f"RunLog_{session_id}.log"
 
-    wb.save(cfg.workbook_path)
+    with open(runlog_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write("DOCILING RUN LOG\n")
+        f.write("=" * 60 + "\n\n")
+
+        for i, row in enumerate(rows, start=1):
+            f.write(f"#{i}\n")
+            f.write(f"Timestamp : {row.get('Timestamp','')}\n")
+            f.write(f"Input     : {row.get('Input','')}\n")
+            f.write(f"Status    : {row.get('Status','')}\n")
+            f.write(f"Outputs   : {row.get('Outputs','')}\n")
+            f.write(f"LogFile   : {row.get('LogFile','')}\n")
+
+            err = row.get("Error", "")
+            if err:
+                f.write("\n--- ERROR ---\n")
+                f.write(err + "\n")
+
+            f.write("\n" + "-" * 60 + "\n\n")
+
+    return runlog_path
 
 
 # ---------- Build file list ----------
-def build_file_list(cfg: Config) -> List[Path]:
+def build_file_list(cfg: Config, logger: Optional[logging.Logger] = None) -> List[Path]:
     files: List[Path] = []
     mode = cfg.input_mode
 
+    def _add_file(p: Path):
+        try:
+            if p.exists() and p.is_file() and p.suffix.lower() in ALL_EXTS:
+                files.append(p.resolve())
+        except Exception:
+            pass
+
+    # Mode: file / list
     if mode in {"file", "list"} and cfg.input_files:
         for p in cfg.input_files:
-            if p.exists() and p.suffix.lower() in ALL_EXTS:
-                files.append(p)
+            # Support wildcards like C:\x\*.pdf
+            s = str(p)
+            if "*" in s or "?" in s:
+                for match in Path(s).parent.glob(Path(s).name):
+                    _add_file(match)
+            else:
+                _add_file(p)
 
+    # Mode: folder
     if mode == "folder" and cfg.input_folder and cfg.input_folder.exists():
         if cfg.recurse_subfolders:
             for p in cfg.input_folder.rglob("*"):
                 if p.is_file() and p.suffix.lower() in ALL_EXTS:
-                    files.append(p)
+                    files.append(p.resolve())
         else:
             for p in cfg.input_folder.iterdir():
                 if p.is_file() and p.suffix.lower() in ALL_EXTS:
-                    files.append(p)
+                    files.append(p.resolve())
 
     # Deduplicate and sort
-    uniq = sorted(set([f.resolve() for f in files]))
+    uniq = sorted(set(files), key=lambda x: str(x).lower())
+
+    if logger:
+        logger.info("Resolved %d input files.", len(uniq))
+        for i, f in enumerate(uniq, start=1):
+            logger.info("  [%d] %s", i, f)
+
     return uniq
 
 
@@ -668,12 +822,17 @@ def main():
         required=False,
         help="Path to .xlsm/.xlsx with 'Exe config' sheet. If omitted, defaults to ~/Downloads/Data Extraction Tool2.3.xlsm"
     )
-    parser.add_argument("--sheet", default="Exe config", help="Sheet name with configuration (default: 'Exe config')")
+    parser.add_argument("--sheet", default="Info", help="Sheet name with configuration (default: 'Exe config')")
     args = parser.parse_args()
 
-    # Default to ~/Downloads/Data Extraction Tool2.3.xlsm if --config not supplied
-    default_cfg = Path.home() / "Downloads" / "Data Extraction Tool2.3.xlsm"
+    default_cfg = Path.home() / "Downloads" / "Data Extraction Tool.xlsm"
     cfg_path = Path(args.config) if args.config else default_cfg
+    
+    cfg = load_config_from_excel(cfg_path, sheet_name=args.sheet)
+
+    # If OutputFolder is not given, default to workbook folder
+    if not cfg.output_folder:
+        cfg.output_folder = cfg.workbook_path.parent
 
     if not cfg_path.exists():
         print(f"Config workbook not found: {cfg_path}", file=sys.stderr)
@@ -688,12 +847,18 @@ def main():
         # Decide final run log path
         output_dir = cfg.output_folder or (Path.home() / "Documents" / "DoclingOutputs")
         output_dir.mkdir(parents=True, exist_ok=True)
+
         final_log = output_dir / f"docling_run_{session_id}.log"
         retarget_logger(logger, temp_log, final_log)
 
+        # NEW: print full config
+        dump_config_to_log(cfg, logger)
+
         runner = DoclingHeadless(cfg, logger)
 
-        files = build_file_list(cfg)
+        # NEW: build file list with logging
+        files = build_file_list(cfg, logger=logger)
+
         if not files:
             raise RuntimeError("No input files resolved from the provided configuration.")
 
@@ -701,12 +866,16 @@ def main():
 
         run_rows = []
         total_ok = 0
+
         for f in files:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 outputs = runner.run_for_file(f, output_dir)
                 outputs_str = ";".join(str(p) for p in outputs)
-                logger.info("Completed: %s\nGenerated:\n%s", f, outputs_str)
+
+                logger.info("Completed: %s", f)
+                logger.info("Generated: %s", outputs_str)
+
                 run_rows.append({
                     "Timestamp": ts,
                     "Input": str(f),
@@ -716,6 +885,7 @@ def main():
                     "LogFile": str(final_log),
                 })
                 total_ok += 1
+
             except Exception as e:
                 err = f"{e}\n{traceback.format_exc()}"
                 logger.exception("Error processing %s", f)
@@ -728,19 +898,17 @@ def main():
                     "LogFile": str(final_log),
                 })
 
-        # Write back to workbook if configured
         if cfg.write_back_runlog:
             try:
-                append_runlog_to_workbook(cfg, run_rows)
-                logger.info("RunLog appended into workbook: %s", cfg.workbook_path)
+                runlog_file = write_runlog_file(cfg, run_rows, output_dir, session_id)
+                logger.info("RunLog file created: %s", runlog_file)
             except Exception:
-                logger.exception("Failed to write RunLog to workbook (macros preserved).")
+                logger.exception("Failed to write RunLog file.")
 
-        # Cleanup temps
+
         runner._cleanup_temp_dirs()
 
         logger.info("All done. Success: %d / %d. Log: %s", total_ok, len(files), final_log)
-        # Exit code 0 if all OK, else 1
         sys.exit(0 if total_ok == len(files) else 1)
 
     except Exception as e:
