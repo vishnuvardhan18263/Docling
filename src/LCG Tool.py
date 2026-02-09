@@ -205,101 +205,41 @@ def dump_config_to_log(cfg: Config, logger: logging.Logger):
 
 
 def load_config_from_excel(workbook_path: Path, sheet_name="Info") -> Config:
-    # keep_vba=True preserves macros if we later save; data_only to read computed values
     wb = load_workbook(workbook_path, data_only=True, keep_vba=workbook_path.suffix.lower() == ".xlsm")
     if sheet_name not in wb.sheetnames:
         raise RuntimeError(f"Config sheet '{sheet_name}' not found in workbook")
 
     ws = wb[sheet_name]
 
-    # Read Key-Value block (A=Key, B=Value)
-    # IMPORTANT FIX:
-    # - Old code stopped at first empty key
-    # - Now we SKIP blanks and continue
-    kv: Dict[str, str] = {}
-    for row in ws.iter_rows(min_row=1, max_col=2):
-        key_cell, val_cell = row[0], row[1]
-        key = (key_cell.value or "").strip() if key_cell.value else ""
-        if not key:
-            continue  # <-- FIX: don't break
-        kv[key] = "" if val_cell.value is None else str(val_cell.value).strip()
-
     cfg = Config(workbook_path=workbook_path, sheet_name=sheet_name)
 
-    # ----------------------------
-    # Support BOTH old + new keys
-    # ----------------------------
+    # -----------------------------
+    # NEW FIXED CELL REFERENCES
+    # -----------------------------
 
-    # Input mode
-    cfg.input_mode = _kv_get(
-        kv,
-        "Input Mode",
-        "InputMode",
-        default=cfg.input_mode
-    ).strip().lower()
+    # PDF path (single file)
+    pdf_path = ws["C5"].value
+    pdf_path = _clean_path_string(pdf_path)
 
-    if cfg.input_mode not in {"file", "folder", "list"}:
-        raise RuntimeError("Input Mode must be one of: file, folder, list")
-
-    # Input file (single)
-    single_file_cell = _kv_get(
-        kv,
-        "Input File (single file)",
-        "InputFile",
-        "Input File",
-        default=""
-    )
-    if single_file_cell:
-        p = _clean_path_string(single_file_cell)
-        if p:
-            cfg.input_files.append(Path(p))
-
-    # Input files (multi) - semicolon separated
-    input_files_cell = _kv_get(
-        kv,
-        "InputFiles",
-        "Input Files",
-        "Input File List",
-        default=""
-    )
-    if input_files_cell:
-        for part in str(input_files_cell).split(";"):
-            p = _clean_path_string(part)
-            if p:
-                cfg.input_files.append(Path(p))
-
-    # Input folder
-    folder_cell = _kv_get(
-        kv,
-        "Input Folder",
-        "InputFolder",
-        default=""
-    )
-    if folder_cell:
-        cfg.input_folder = Path(_clean_path_string(folder_cell))
-
-    # Recurse
-    cfg.recurse_subfolders = _read_bool(
-        _kv_get(kv, "Recurse Subfolders", "RecurseSubfolders", default="FALSE"),
-        default=False
-    )
+    if pdf_path:
+        cfg.input_mode = "file"
+        cfg.input_files = [Path(pdf_path)]
 
     # Output folder
-    out_cell = _kv_get(
-        kv,
-        "Output Folder",
-        "OutputFolder",
-        default=""
-    )
-    cfg.output_folder = Path(_clean_path_string(out_cell)) if out_cell else None
+    out_folder = ws["C9"].value
+    out_folder = _clean_path_string(out_folder)
+    if out_folder:
+        cfg.output_folder = Path(out_folder)
+
+    # Input mode
+    cfg.input_mode = str(ws["C12"].value or "file").strip().lower()
+    # If input_mode is file, always use the PDF path from C5
+    if cfg.input_mode == "file" and pdf_path:
+        cfg.input_files = [Path(pdf_path)]
+
 
     # Output formats
-    formats_cell = _kv_get(
-        kv,
-        "Output Formats",
-        "OutputFormats",
-        default=""
-    )
+    formats_cell = str(ws["C13"].value or "Excel").strip()
     if formats_cell:
         fmts = [f.strip() for f in formats_cell.split(",") if f.strip()]
         norm = []
@@ -313,78 +253,33 @@ def load_config_from_excel(workbook_path: Path, sheet_name="Info") -> Config:
                 norm.append("Text")
             elif fl == "csv":
                 norm.append("CSV")
-        cfg.output_formats = norm or cfg.output_formats
+        cfg.output_formats = norm or ["Excel"]
 
     # DPI
-    cfg.dpi = _read_int(_kv_get(kv, "DPI", default="300"), default=300, lo=72, hi=1200)
+    cfg.dpi = _read_int(ws["C14"].value, default=300, lo=72, hi=1200)
 
     # Orientation
-    cfg.orientation = _read_int(
-        _kv_get(kv, "Orientation (Rotation)", "Orientation", default="0"),
-        default=0
-    )
+    cfg.orientation = _read_int(ws["C15"].value, default=0)
     if cfg.orientation not in {0, 90, 180, 270}:
         cfg.orientation = 0
 
     # Scanned PDF
-    cfg.is_scanned_pdf = _read_bool(
-        _kv_get(kv, "Scanned PDF", "IsScannedPDF", default="FALSE"),
-        default=False
-    )
+    cfg.is_scanned_pdf = _read_bool(ws["C16"].value, default=False)
 
     # Grayscale
-    cfg.grayscale = _read_bool(
-        _kv_get(kv, "Grayscale (PDF only)", "Grayscale", default="FALSE"),
-        default=False
-    )
+    cfg.grayscale = _read_bool(ws["C17"].value, default=False)
 
     # Excel layout
-    cfg.tables_single_sheet = _read_bool(
-        _kv_get(kv, "Excel: Tables Single Sheet", "ExcelTablesSingleSheet", default="TRUE"),
-        default=True
-    )
+    cfg.tables_single_sheet = _read_bool(ws["C18"].value, default=True)
 
-    cfg.blank_lines = _read_int(
-        _kv_get(kv, "Excel: Blank Lines Between Tables", "ExcelBlankLines", default="1"),
-        default=1, lo=0, hi=50
-    )
+    cfg.blank_lines = _read_int(ws["C19"].value, default=1, lo=0, hi=50)
 
     # Write RunLog back
-    cfg.write_back_runlog = _read_bool(
-        _kv_get(kv, "Write Run Log Back to Excel", "WriteBackRunLog", default="TRUE"),
-        default=True
-    )
-
-    # Additionally scan for an "Inputs" table with header "InputPath"
-    header_row = None
-    for row in ws.iter_rows(min_row=1, max_col=1):
-        cell = row[0]
-        if cell.value and str(cell.value).strip().lower() == "inputpath":
-            header_row = cell.row
-            break
-
-    if header_row:
-        r = header_row + 1
-        while True:
-            v = ws.cell(row=r, column=1).value
-            if v is None or str(v).strip() == "":
-                break
-            cfg.input_files.append(Path(_clean_path_string(str(v))))
-            r += 1
-
-    # De-duplicate input files
-    if cfg.input_files:
-        dedup = []
-        seen = set()
-        for p in cfg.input_files:
-            s = str(p)
-            if s not in seen:
-                dedup.append(p)
-                seen.add(s)
-        cfg.input_files = dedup
+    cfg.write_back_runlog = _read_bool(ws["C20"].value, default=True)
 
     wb.close()
     return cfg
+
 
 
 # ---------- Core Processor ----------
@@ -816,13 +711,13 @@ def build_file_list(cfg: Config, logger: Optional[logging.Logger] = None) -> Lis
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Headless Docling OCR runner driven by Excel config.")
+    parser = argparse.ArgumentParser(description="Headless Docling OCR runner driven by Info.")
     parser.add_argument(
         "--config",
         required=False,
-        help="Path to .xlsm/.xlsx with 'Exe config' sheet. If omitted, defaults to ~/Downloads/Data Extraction Tool2.3.xlsm"
+        help="Path to .xlsm/.xlsx with 'Info' sheet. If omitted, defaults to ~/Downloads/Data Extraction Tool.xlsm"
     )
-    parser.add_argument("--sheet", default="Info", help="Sheet name with configuration (default: 'Exe config')")
+    parser.add_argument("--sheet", default="Info", help="Sheet name with configuration (default: 'Info')")
     args = parser.parse_args()
 
     default_cfg = Path.home() / "Downloads" / "Data Extraction Tool.xlsm"
